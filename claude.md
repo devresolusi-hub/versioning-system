@@ -12,7 +12,7 @@ After finishing each task, create or update the appropriate markdown file with:
 * Final outcome or next steps
 * Check task lists in claude.md
 
-### Context: todo\002_setup.md
+### Context: 003_supabase_setup.md
 
 ### Tasks:
-* [ ] Proceed with context
+* [ ] Create the .env.example and proceed with context
