@@ -1,6 +1,7 @@
 import { json, type RequestHandler } from '@sveltejs/kit';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
-import { env } from '$env/dynamic/private';
+import { SUPABASE_SERVICE_ROLE_KEY } from '$env/static/private';
+import { PUBLIC_SUPABASE_URL } from '$env/static/public';
 
 const MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024; // 100MB
 const FILE_NAME_REGEX = /^[A-Za-z0-9_-]+$/;
@@ -25,9 +26,9 @@ type VersionRecord = {
 };
 
 function getSupabaseServiceClient(): SupabaseClient {
-	// Use SvelteKit private env, falling back to process.env for test runners
-	const supabaseUrl = env.PUBLIC_SUPABASE_URL ?? process.env.PUBLIC_SUPABASE_URL;
-	const serviceRoleKey = env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.SUPABASE_SERVICE_ROLE_KEY;
+	// Use SvelteKit env, falling back to process.env for test runners
+	const supabaseUrl = PUBLIC_SUPABASE_URL ?? process.env.PUBLIC_SUPABASE_URL;
+	const serviceRoleKey = SUPABASE_SERVICE_ROLE_KEY ?? process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 	if (!supabaseUrl || !serviceRoleKey) {
 		console.error('Missing PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in environment.');
@@ -362,7 +363,7 @@ export const POST: RequestHandler = async ({ request }) => {
 
 	// Fallback: construct URL manually if necessary
 	if (!downloadUrl) {
-		const supabaseUrl = env.PUBLIC_SUPABASE_URL;
+		const supabaseUrl = PUBLIC_SUPABASE_URL ?? process.env.PUBLIC_SUPABASE_URL;
 		if (supabaseUrl) {
 			downloadUrl = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/public/${storagePath}`;
 		}
