@@ -1,7 +1,7 @@
 import { json, type RequestHandler } from '@sveltejs/kit';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
-import JSZip from 'jszip';
-import { SUPABASE_SERVICE_ROLE_KEY } from '$env/static/private';
+import { Storage as MegaStorage } from 'megajs';
+import { SUPABASE_SERVICE_ROLE_KEY, MEGA_EMAIL, MEGA_PASSWORD } from '$env/static/private';
 import { PUBLIC_SUPABASE_URL } from '$env/static/public';
 
 const MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024; // 100MB (absolute limit for requests)
@@ -27,6 +27,8 @@ type VersionRecord = {
 	uploaded_at: string;
 };
 
+type StorageProvider = 'supabase' | 'mega';
+
 function getSupabaseServiceClient(): SupabaseClient {
 	// Use SvelteKit env, falling back to process.env for test runners
 	const supabaseUrl = PUBLIC_SUPABASE_URL ?? process.env.PUBLIC_SUPABASE_URL;
@@ -43,6 +45,24 @@ function getSupabaseServiceClient(): SupabaseClient {
 			persistSession: false
 		}
 	});
+}
+
+async function getMegaClient() {
+	// Use environment variables (from .env/.env.local)
+	const email = MEGA_EMAIL ?? process.env.MEGA_EMAIL;
+	const password = MEGA_PASSWORD ?? process.env.MEGA_PASSWORD;
+	if (!email || !password) {
+		console.error('Missing MEGA_EMAIL or MEGA_PASSWORD in environment.');
+		throw new Error('MEGA configuration error');
+	}
+
+	const storage = new MegaStorage({
+		email,
+		password
+	});
+
+	await storage.ready;
+	return storage;
 }
 
 function badRequest(message: string) {
@@ -279,82 +299,137 @@ export const POST: RequestHandler = async ({ request }) => {
 	}
 
 	// -----------------------------------------------------------------------
-	// 5. Upload file to Supabase Storage
+	// 5. Upload file to appropriate storage (Supabase or MEGA)
 	// -----------------------------------------------------------------------
 	const originalFileName = file.name || `${trimmedFileName}-${trimmedVersion}`;
 	const originalContentType = file.type || 'application/octet-stream';
+	const originalFileSize = file.size;
+	const originalFileType = originalContentType;
 
-	// Decide whether to compress before upload
-	let objectPath: string;
+	let storageProvider: StorageProvider;
+	let objectPath: string | null = null;
 	let storagePath: string;
 	let contentType: string;
 	let fileBuffer: Uint8Array;
 	let storedFileSize: number;
 	let storedFileType: string;
-	let isCompressed = false;
-	const originalFileSize = file.size;
-	const originalFileType = originalContentType;
+	let downloadUrl: string | null = null;
 
 	try {
-		if (file.size > SUPABASE_OBJECT_SIZE_LIMIT_BYTES) {
-			// File is too large for a single Supabase object → compress to ZIP
-			isCompressed = true;
+		console.info('Preparing file for upload', {
+			originalFileName,
+			originalFileSize,
+			originalFileType,
+			supabaseObjectSizeLimit: SUPABASE_OBJECT_SIZE_LIMIT_BYTES,
+			maxRequestSize: MAX_FILE_SIZE_BYTES
+		});
 
-			const zip = new JSZip();
-			const originalArrayBuffer = await file.arrayBuffer();
-			const originalUint8 = new Uint8Array(originalArrayBuffer);
+		const arrayBuffer = await file.arrayBuffer();
+		fileBuffer = new Uint8Array(arrayBuffer);
 
-			zip.file(originalFileName, originalUint8);
+		if (file.size <= SUPABASE_OBJECT_SIZE_LIMIT_BYTES) {
+			// Use Supabase Storage for files within object size limit
+			storageProvider = 'supabase';
 
-			const compressed = await zip.generateAsync({ type: 'uint8array' });
-
-			const zipFileName = originalFileName.endsWith('.zip')
-				? originalFileName
-				: `${originalFileName}.zip`;
-
-			objectPath = `${trimmedFileName}/${trimmedVersion}/${zipFileName}`;
-			storagePath = `${STORAGE_BUCKET}/${objectPath}`;
-			contentType = 'application/zip';
-			fileBuffer = compressed;
-			storedFileSize = compressed.length;
-			storedFileType = contentType;
-
-			if (storedFileSize > MAX_FILE_SIZE_BYTES) {
-				return payloadTooLarge(
-					'File is too large even after compression. Maximum allowed size is 100MB.'
-				);
-			}
-		} else {
-			// File is within Supabase object limit → upload as-is
 			objectPath = `${trimmedFileName}/${trimmedVersion}/${originalFileName}`;
 			storagePath = `${STORAGE_BUCKET}/${objectPath}`;
 			contentType = originalContentType;
-			const arrayBuffer = await file.arrayBuffer();
-			fileBuffer = new Uint8Array(arrayBuffer);
 			storedFileSize = file.size;
 			storedFileType = contentType;
+
+			console.info('Routing upload to Supabase Storage', {
+				objectPath,
+				storedFileSize,
+				storedFileType
+			});
+		} else {
+			// Use MEGA for larger files
+			storageProvider = 'mega';
+			contentType = originalContentType;
+			storedFileSize = file.size;
+			storedFileType = contentType;
+
+			console.info('Routing upload to MEGA storage', {
+				originalFileName,
+				storedFileSize,
+				storedFileType
+			});
+
+			try {
+				const mega = await getMegaClient();
+
+				console.info('Uploading to MEGA...', {
+					originalFileName,
+					storedFileSize
+				});
+
+				const upload = mega.upload(
+					{
+						name: originalFileName,
+						size: storedFileSize
+					},
+					Buffer.from(fileBuffer)
+				);
+
+				const uploadedFile = await new Promise<any>((resolve, reject) => {
+					upload.on('complete', resolve);
+					upload.on('error', reject);
+				});
+
+				const megaLink = await uploadedFile.link();
+
+				storagePath = megaLink;
+				downloadUrl = megaLink;
+
+				console.info('Upload to MEGA completed', {
+					originalFileName,
+					megaLink
+				});
+			} catch (err) {
+				console.error('Error uploading to MEGA:', err);
+				return internalError('Failed to upload file to cloud storage');
+			}
 		}
 	} catch (err) {
-		console.error('Error preparing file for upload (compression step):', err);
+		console.error('Error preparing file for upload:', err);
 		return internalError('Failed to prepare file for upload');
 	}
 
-	try {
-		const { error: uploadError } = await supabase.storage
-			.from(STORAGE_BUCKET)
-			.upload(objectPath, fileBuffer, {
+	// If using Supabase, perform the storage upload now
+		if (storageProvider === 'supabase' && objectPath) {
+		try {
+			console.info('Uploading to Supabase Storage', {
+				bucket: STORAGE_BUCKET,
+				objectPath,
 				contentType,
-				cacheControl: '3600',
-				upsert: false
+				storedFileSize
 			});
 
-		if (uploadError) {
-			console.error('Error uploading file to Supabase Storage:', uploadError);
+			const { error: uploadError } = await supabase.storage
+				.from(STORAGE_BUCKET)
+				.upload(objectPath!, fileBuffer, {
+					contentType,
+					cacheControl: '3600',
+					upsert: false
+				});
+
+			if (uploadError) {
+				console.error('Error uploading file to Supabase Storage:', uploadError, {
+					message: (uploadError as Error).message,
+					name: (uploadError as Error).name
+				});
+				return internalError('Failed to upload file to storage');
+			}
+
+			storagePath = `${STORAGE_BUCKET}/${objectPath}`;
+		} catch (err) {
+			console.error('Unexpected error during storage upload:', err, {
+				bucket: STORAGE_BUCKET,
+				objectPath,
+				storedFileSize
+			});
 			return internalError('Failed to upload file to storage');
 		}
-	} catch (err) {
-		console.error('Unexpected error during storage upload:', err);
-		return internalError('Failed to upload file to storage');
 	}
 
 	// -----------------------------------------------------------------------
@@ -373,7 +448,7 @@ export const POST: RequestHandler = async ({ request }) => {
 				file_type: storedFileType,
 				metadata: {
 					...(metadata ?? {}),
-					compression: isCompressed ? 'zip' : 'none',
+					storageProvider,
 					originalFileSize,
 					originalFileType
 				},
@@ -384,11 +459,13 @@ export const POST: RequestHandler = async ({ request }) => {
 
 		if (error || !data) {
 			console.error('Error inserting version record, attempting to remove uploaded file:', error);
-			// Best-effort rollback of storage upload
-			try {
-				await supabase.storage.from(STORAGE_BUCKET).remove([objectPath]);
-			} catch (removeErr) {
-				console.error('Error rolling back storage upload:', removeErr);
+			// Best-effort rollback of storage upload (only for Supabase)
+			if (storageProvider === 'supabase' && objectPath) {
+				try {
+					await supabase.storage.from(STORAGE_BUCKET).remove([objectPath]);
+				} catch (removeErr) {
+					console.error('Error rolling back storage upload:', removeErr);
+				}
 			}
 
 			return internalError('Failed to create version record');
@@ -397,11 +474,13 @@ export const POST: RequestHandler = async ({ request }) => {
 		versionRecord = data as VersionRecord;
 	} catch (err) {
 		console.error('Unexpected error inserting version record:', err);
-		// Best-effort rollback of storage upload
-		try {
-			await supabase.storage.from(STORAGE_BUCKET).remove([objectPath]);
-		} catch (removeErr) {
-			console.error('Error rolling back storage upload:', removeErr);
+		// Best-effort rollback of Supabase storage upload (not applicable for MEGA)
+		if (storageProvider === 'supabase' && objectPath) {
+			try {
+				await supabase.storage.from(STORAGE_BUCKET).remove([objectPath]);
+			} catch (removeErr) {
+				console.error('Error rolling back storage upload:', removeErr);
+			}
 		}
 
 		return internalError('Failed to create version record');
@@ -410,20 +489,25 @@ export const POST: RequestHandler = async ({ request }) => {
 	// -----------------------------------------------------------------------
 	// 7. Generate download URL
 	// -----------------------------------------------------------------------
-	let downloadUrl: string | null = null;
-
-	try {
-		const { data } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(objectPath);
-		downloadUrl = data?.publicUrl ?? null;
-	} catch (err) {
-		console.error('Error generating public URL for storage object:', err);
+	if (storageProvider === 'supabase' && objectPath) {
+		try {
+			const { data } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(objectPath as string);
+			downloadUrl = data?.publicUrl ?? null;
+		} catch (err) {
+			console.error('Error generating public URL for storage object:', err);
+		}
 	}
 
-	// Fallback: construct URL manually if necessary
-	if (!downloadUrl) {
+	// Final rule:
+	// - If we already have an HTTPS URL (Supabase public URL or MEGA link), use it.
+	// - Otherwise, construct a Supabase public URL from storagePath.
+	let finalDownloadUrl: string | null = null;
+	if (downloadUrl && downloadUrl.includes('https://mega.nz')) {
+		finalDownloadUrl = downloadUrl;
+	} else {
 		const supabaseUrl = PUBLIC_SUPABASE_URL ?? process.env.PUBLIC_SUPABASE_URL;
 		if (supabaseUrl) {
-			downloadUrl = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/public/${storagePath}`;
+			finalDownloadUrl = `${supabaseUrl.replace(/\/$/, '')}/storage/v1/object/public/${storagePath}`;
 		}
 	}
 
@@ -437,9 +521,10 @@ export const POST: RequestHandler = async ({ request }) => {
 				fileName: trimmedFileName,
 				version: trimmedVersion,
 				storagePath,
-				fileSize: file.size,
-				fileType: contentType,
-				downloadUrl,
+				storageProvider,
+				fileSize: storedFileSize,
+				fileType: storedFileType,
+				downloadUrl: finalDownloadUrl ?? storagePath,
 				uploadedAt: versionRecord.uploaded_at,
 				uploadedBy: uploaderName
 			}
@@ -447,5 +532,3 @@ export const POST: RequestHandler = async ({ request }) => {
 		{ status: 201 }
 	);
 };
-
-

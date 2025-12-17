@@ -8,7 +8,9 @@ This document explains how to set up, run, and extend the File Versioning System
 
 - **Frontend / Backend**: SvelteKit (SSR + API routes)
 - **Database**: Supabase PostgreSQL
-- **Storage**: Supabase Storage (public bucket `files`)
+- **Storage**:
+  - Supabase Storage (public bucket `files`) for files up to 50MB.
+  - MEGA Cloud Storage (via `megajs`) for larger files (up to the 100MB request limit).
 - **Auth**: DB-backed API keys in `api_keys` table
 
 Key flows:
@@ -46,10 +48,12 @@ pnpm install
 
 2. Fill in values:
 
-   - `PUBLIC_SUPABASE_URL` – your Supabase project URL (`https://xxxxx.supabase.co`)
-   - `PUBLIC_SUPABASE_ANON_KEY` – anon/public key (from Supabase → Settings → API)
-   - `SUPABASE_SERVICE_ROLE_KEY` – **service role key** (server-side only; never expose to clients)
-   - `DATABASE_URL` – Postgres connection string (from Supabase)
+- `PUBLIC_SUPABASE_URL` – your Supabase project URL (`https://xxxxx.supabase.co`)
+- `PUBLIC_SUPABASE_ANON_KEY` – anon/public key (from Supabase → Settings → API)
+- `SUPABASE_SERVICE_ROLE_KEY` – **service role key** (server-side only; never expose to clients)
+- `DATABASE_URL` – Postgres connection string (from Supabase)
+- `MEGA_EMAIL` – email of the MEGA account used for large-file storage.
+- `MEGA_PASSWORD` – password of the MEGA account.
 
 `.env` is git-ignored; only `.env.example` is committed.
 
@@ -122,16 +126,25 @@ Responsibilities:
 - **DB & Storage**
   - Gets or creates `file_metadata` row by `file_name`.
   - Checks `versions` for duplicate `(file_metadata_id, version)` → 409 Conflict.
-  - Uploads to Supabase Storage:
-    - Bucket: `files`
-    - Object path: `{fileName}/{version}/{originalFilename}`
-    - `storage_path` column: `files/{fileName}/{version}/{originalFilename}`
-  - Inserts into `versions` with metadata and `uploaded_by` (API key name).
+  - Routes storage based on file size:
+    - For files **≤ 50MB**:
+      - Uploads to Supabase Storage:
+        - Bucket: `files`
+        - Object path: `{fileName}/{version}/{originalFilename}`
+        - `storage_path` column: `files/{fileName}/{version}/{originalFilename}`
+    - For files **> 50MB**:
+      - Uploads to MEGA via `megajs`.
+      - Stores the public MEGA link in `storage_path`.
+  - Inserts into `versions` with:
+    - `file_size`, `file_type`,
+    - `metadata.storageProvider` (`'supabase'` or `'mega'`),
+    - `metadata.originalFileSize` / `metadata.originalFileType`,
+    - `uploaded_by` (API key name).
   - Trigger ensures `is_latest` is correct.
 - **Response**
   - 201 success with:
     - `fileMetadataId`, `versionId`, `fileName`, `version`,
-      `storagePath`, `fileSize`, `fileType`, `downloadUrl`,
+      `storagePath`, `storageProvider`, `fileSize`, `fileType`, `downloadUrl`,
       `uploadedAt`, `uploadedBy`.
   - Proper JSON errors for 400/401/409/413/500 (see `SDD.md`).
 
@@ -155,7 +168,9 @@ Behavior:
   - All versions with:
     - Version number, size, MIME type, upload time.
     - “Latest” badge where `is_latest = TRUE`.
-    - Download button using Supabase public URL.
+    - Download button:
+      - If `storage_path` is a full URL (e.g. starts with `https://mega.nz`), it links directly there.
+      - Otherwise, it builds a Supabase public URL from `storage_path`.
 - States:
   - Normal (list), error (loadError), and empty (no files).
 

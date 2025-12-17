@@ -21,7 +21,9 @@ A lightweight file versioning system that allows automated CI/CD pipelines to up
 ### 1.3 Technology Stack
 - **Frontend/Backend:** SvelteKit (SSR + API routes)
 - **Database:** Supabase (PostgreSQL)
-- **Storage:** Supabase Storage
+- **Storage:**
+  - Supabase Storage (public bucket `files`) for files up to 50MB.
+  - MEGA Cloud Storage (via `megajs`) for larger files (up to the 100MB request limit).
 - **Deployment:** Vercel/Netlify (recommended)
 
 ---
@@ -86,8 +88,12 @@ A lightweight file versioning system that allows automated CI/CD pipelines to up
   - Manages relationships between files and versions
 
 - **Supabase Storage**
-  - Stores actual file binaries
+  - Stores actual file binaries for objects ≤ 50MB
   - Organized by file name and version
+
+- **MEGA Cloud Storage**
+  - Stores larger file binaries using `megajs`
+  - Exposes public links that are stored directly in the `versions.storage_path` column
 
 ---
 
@@ -235,7 +241,7 @@ CREATE INDEX idx_versions_uploaded_by ON versions(uploaded_by);
 - `id`: Unique identifier (UUID)
 - `file_metadata_id`: Foreign key to file_metadata
 - `version`: Version string (e.g., "1.0.0", "2.1.3", "build-123")
-- `storage_path`: Full path in Supabase Storage
+- `storage_path`: Supabase storage key (e.g. `files/myapp/1.0.0/app.zip`) **or** full external URL (e.g. MEGA link)
 - `file_size`: File size in bytes
 - `file_type`: MIME type (e.g., "application/zip")
 - `uploaded_at`: Upload timestamp
@@ -253,7 +259,7 @@ CREATE INDEX idx_versions_uploaded_by ON versions(uploaded_by);
 
 **Supabase Storage Bucket:** `files` (public bucket)
 
-**Path Convention:**
+**Path Convention (Supabase-backed files):**
 ```
 files/
   ├── {file_name}/
@@ -266,7 +272,7 @@ files/
           └── {original_filename}
 ```
 
-**Example:**
+**Example (Supabase):**
 ```
 files/
   ├── myapp/
@@ -278,6 +284,10 @@ files/
       └── 1.5.0/
           └── installer.exe
 ```
+
+**MEGA-backed files:**
+- For files stored in MEGA, the `storage_path` column stores the full MEGA link (e.g. `https://mega.nz/file/...`).
+- The home page uses the `storage_path` directly as the download URL when it starts with `http://` or `https://`.
 
 ---
 
@@ -491,6 +501,7 @@ metadata: {"commit": "abc123", "branch": "main"} (optional, JSON string)
 | metadata   | JSON   | No       | Additional metadata (commit, build info) |
 
 #### Success Response (201 Created)
+For Supabase-backed files:
 ```json
 {
   "success": true,
@@ -501,8 +512,31 @@ metadata: {"commit": "abc123", "branch": "main"} (optional, JSON string)
     "fileName": "myapp",
     "version": "1.0.0",
     "storagePath": "files/myapp/1.0.0/myapp-v1.0.0.zip",
+    "storageProvider": "supabase",
     "fileSize": 2048576,
+    "fileType": "application/zip",
     "downloadUrl": "https://your-supabase-project.supabase.co/storage/v1/object/public/files/myapp/1.0.0/myapp-v1.0.0.zip",
+    "uploadedAt": "2025-12-16T10:30:00Z",
+    "uploadedBy": "github-actions-main"
+  }
+}
+```
+
+For MEGA-backed files:
+```json
+{
+  "success": true,
+  "message": "File uploaded successfully",
+  "data": {
+    "fileMetadataId": "uuid-here",
+    "versionId": "uuid-here",
+    "fileName": "big-video",
+    "version": "1.0.0",
+    "storagePath": "https://mega.nz/file/....",
+    "storageProvider": "mega",
+    "fileSize": 67917768,
+    "fileType": "video/quicktime",
+    "downloadUrl": "https://mega.nz/file/....",
     "uploadedAt": "2025-12-16T10:30:00Z",
     "uploadedBy": "github-actions-main"
   }
@@ -753,21 +787,22 @@ console.log('New API Key:', generateApiKey());
    │   ├─► Query: SELECT FROM file_metadata WHERE file_name = ?
    │   └─► If not exists: INSERT INTO file_metadata
    │
-   ├─► Generate Storage Path
-   │   └─► Format: files/{fileName}/{version}/{originalFileName}
-   │
-   ├─► Upload File to Supabase Storage
-   │   ├─► Use Supabase Storage API
-   │   ├─► Set content type
-   │   └─► If fails: Return 500
+   ├─► Decide Storage Provider
+   │   ├─► If file size ≤ 50MB:
+   │   │     ├─► Generate storage path: files/{fileName}/{version}/{originalFileName}
+   │   │     └─► Upload file to Supabase Storage (bucket `files`)
+   │   └─► If file size > 50MB:
+   │         ├─► Upload file to MEGA via `megajs`
+   │         └─► Store MEGA public link as storage_path
    │
    ├─► Create Version Record
-   │   ├─► INSERT INTO versions (include uploaded_by = key_name)
+   │   ├─► INSERT INTO versions (include uploaded_by = key_name, plus storage metadata)
    │   ├─► Trigger automatically updates is_latest flag
    │   └─► If fails: Rollback storage upload & Return 500
    │
    ├─► Generate Download URL
-   │   └─► Get public URL from Supabase Storage
+   │   ├─► If using Supabase: get public URL from Supabase Storage (with fallback)
+   │   └─► If using MEGA: use MEGA public link directly
    │
    └─► Return Success Response (201)
        └─► Include downloadUrl, versionId, metadata, uploaded_by
@@ -1013,6 +1048,8 @@ console.log('New API Key:', generateApiKey());
 PUBLIC_SUPABASE_URL=https://xxxxx.supabase.co
 PUBLIC_SUPABASE_ANON_KEY=eyJhbGc... # For public read access
 SUPABASE_SERVICE_ROLE_KEY=eyJhbGc... # For server-side operations (uploads, API key validation)
+MEGA_EMAIL=your-mega-email@example.com # For large-file storage via MEGA
+MEGA_PASSWORD=your-mega-password       # For large-file storage via MEGA
 
 # Production (Set in hosting platform like Vercel/Netlify)
 # Same variables, but with production values
@@ -1617,7 +1654,7 @@ ORDER BY v.uploaded_at DESC;
 | **API Key** | Unique token stored in database for authenticating CI/CD upload requests |
 | **File Metadata** | Parent record representing a unique file by name |
 | **Version** | Specific iteration of a file with version identifier |
-| **Storage Path** | Location of file in Supabase Storage bucket |
+| **Storage Path** | Supabase storage key or full external URL (e.g. MEGA link) |
 | **Latest Version** | Most recently uploaded version of a file |
 | **RLS** | Row Level Security - Supabase feature for access control |
 | **Service Role Key** | Supabase admin key for server-side operations (bypasses RLS) |

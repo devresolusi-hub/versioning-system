@@ -82,7 +82,12 @@ export const load: PageServerLoad = async () => {
 				.sort((a, b) => new Date(b.uploaded_at).getTime() - new Date(a.uploaded_at).getTime())
 				.map<FileVersionView>((v) => {
 					const storagePath = v.storage_path;
-					const downloadUrl = `${downloadBase}/${storagePath}`;
+					// If storagePath is already a full URL (e.g. MEGA link), use it directly.
+					// Otherwise, construct a Supabase public URL.
+					const downloadUrl =
+						storagePath.startsWith('http://') || storagePath.startsWith('https://')
+							? storagePath
+							: `${downloadBase}/${storagePath}`;
 
 					return {
 						id: v.id,
