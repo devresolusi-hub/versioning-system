@@ -25,8 +25,9 @@ type VersionRecord = {
 };
 
 function getSupabaseServiceClient(): SupabaseClient {
-	const supabaseUrl = env.PUBLIC_SUPABASE_URL;
-	const serviceRoleKey = env.SUPABASE_SERVICE_ROLE_KEY;
+	// Use SvelteKit private env, falling back to process.env for test runners
+	const supabaseUrl = env.PUBLIC_SUPABASE_URL ?? process.env.PUBLIC_SUPABASE_URL;
+	const serviceRoleKey = env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 	if (!supabaseUrl || !serviceRoleKey) {
 		console.error('Missing PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in environment.');
@@ -97,61 +98,8 @@ function internalError(message = 'An error occurred while processing your reques
 }
 
 export const POST: RequestHandler = async ({ request }) => {
-	let supabase: SupabaseClient;
-
-	try {
-		supabase = getSupabaseServiceClient();
-	} catch (err) {
-		console.error('Supabase client initialization failed:', err);
-		return internalError();
-	}
-
 	// -----------------------------------------------------------------------
-	// 1. API key authentication
-	// -----------------------------------------------------------------------
-	const authHeader = request.headers.get('authorization');
-
-	if (!authHeader || !authHeader.startsWith('Bearer ')) {
-		return unauthorized('Missing or invalid Authorization header');
-	}
-
-	const providedKey = authHeader.replace('Bearer', '').trim();
-	if (!providedKey) {
-		return unauthorized('Missing API key');
-	}
-
-	let apiKey: ApiKeyRecord | null = null;
-
-	try {
-		const { data, error } = await supabase
-			.from('api_keys')
-			.select('id, key_name, is_active')
-			.eq('key_value', providedKey)
-			.eq('is_active', true)
-			.limit(1)
-			.maybeSingle();
-
-		if (error || !data) {
-			console.warn('API key validation failed:', error ?? 'No matching key');
-			return unauthorized();
-		}
-
-		apiKey = data;
-
-		// Update last_used_at timestamp (best-effort)
-		await supabase
-			.from('api_keys')
-			.update({ last_used_at: new Date().toISOString() })
-			.eq('id', apiKey.id);
-	} catch (err) {
-		console.error('Error validating API key:', err);
-		return internalError();
-	}
-
-	const uploaderName = apiKey.key_name;
-
-	// -----------------------------------------------------------------------
-	// 2. Parse and validate multipart/form-data
+	// 1. Parse and validate multipart/form-data (before touching Supabase)
 	// -----------------------------------------------------------------------
 	let formData: FormData;
 	try {
@@ -209,6 +157,61 @@ export const POST: RequestHandler = async ({ request }) => {
 			return badRequest('Invalid metadata JSON');
 		}
 	}
+
+	// -----------------------------------------------------------------------
+	// 2. Initialize Supabase client
+	// -----------------------------------------------------------------------
+	let supabase: SupabaseClient;
+	try {
+		supabase = getSupabaseServiceClient();
+	} catch (err) {
+		console.error('Supabase client initialization failed:', err);
+		return internalError();
+	}
+
+	// -----------------------------------------------------------------------
+	// 3. API key authentication
+	// -----------------------------------------------------------------------
+	const authHeader = request.headers.get('authorization');
+
+	if (!authHeader || !authHeader.startsWith('Bearer ')) {
+		return unauthorized('Missing or invalid Authorization header');
+	}
+
+	const providedKey = authHeader.replace('Bearer', '').trim();
+	if (!providedKey) {
+		return unauthorized('Missing API key');
+	}
+
+	let apiKey: ApiKeyRecord | null = null;
+
+	try {
+		const { data, error } = await supabase
+			.from('api_keys')
+			.select('id, key_name, is_active')
+			.eq('key_value', providedKey)
+			.eq('is_active', true)
+			.limit(1)
+			.maybeSingle();
+
+		if (error || !data) {
+			console.warn('API key validation failed:', error ?? 'No matching key');
+			return unauthorized();
+		}
+
+		apiKey = data;
+
+		// Update last_used_at timestamp (best-effort)
+		await supabase
+			.from('api_keys')
+			.update({ last_used_at: new Date().toISOString() })
+			.eq('id', apiKey.id);
+	} catch (err) {
+		console.error('Error validating API key:', err);
+		return internalError();
+	}
+
+	const uploaderName = apiKey.key_name;
 
 	// -----------------------------------------------------------------------
 	// 3. Get or create file_metadata record
