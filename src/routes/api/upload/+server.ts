@@ -1,9 +1,11 @@
 import { json, type RequestHandler } from '@sveltejs/kit';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
+import JSZip from 'jszip';
 import { SUPABASE_SERVICE_ROLE_KEY } from '$env/static/private';
 import { PUBLIC_SUPABASE_URL } from '$env/static/public';
 
-const MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024; // 100MB
+const MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024; // 100MB (absolute limit for requests)
+const SUPABASE_OBJECT_SIZE_LIMIT_BYTES = 50 * 1024 * 1024; // 50MB (per-object limit in Supabase Storage)
 const FILE_NAME_REGEX = /^[A-Za-z0-9_-]+$/;
 // Allow common version patterns: semantic versions, build numbers, tags
 const VERSION_REGEX = /^[A-Za-z0-9._-]+$/;
@@ -280,13 +282,64 @@ export const POST: RequestHandler = async ({ request }) => {
 	// 5. Upload file to Supabase Storage
 	// -----------------------------------------------------------------------
 	const originalFileName = file.name || `${trimmedFileName}-${trimmedVersion}`;
-	const objectPath = `${trimmedFileName}/${trimmedVersion}/${originalFileName}`;
-	const storagePath = `${STORAGE_BUCKET}/${objectPath}`;
-	const contentType = file.type || 'application/octet-stream';
+	const originalContentType = file.type || 'application/octet-stream';
+
+	// Decide whether to compress before upload
+	let objectPath: string;
+	let storagePath: string;
+	let contentType: string;
+	let fileBuffer: Uint8Array;
+	let storedFileSize: number;
+	let storedFileType: string;
+	let isCompressed = false;
+	const originalFileSize = file.size;
+	const originalFileType = originalContentType;
 
 	try {
-		const fileBuffer = new Uint8Array(await file.arrayBuffer());
+		if (file.size > SUPABASE_OBJECT_SIZE_LIMIT_BYTES) {
+			// File is too large for a single Supabase object → compress to ZIP
+			isCompressed = true;
 
+			const zip = new JSZip();
+			const originalArrayBuffer = await file.arrayBuffer();
+			const originalUint8 = new Uint8Array(originalArrayBuffer);
+
+			zip.file(originalFileName, originalUint8);
+
+			const compressed = await zip.generateAsync({ type: 'uint8array' });
+
+			const zipFileName = originalFileName.endsWith('.zip')
+				? originalFileName
+				: `${originalFileName}.zip`;
+
+			objectPath = `${trimmedFileName}/${trimmedVersion}/${zipFileName}`;
+			storagePath = `${STORAGE_BUCKET}/${objectPath}`;
+			contentType = 'application/zip';
+			fileBuffer = compressed;
+			storedFileSize = compressed.length;
+			storedFileType = contentType;
+
+			if (storedFileSize > MAX_FILE_SIZE_BYTES) {
+				return payloadTooLarge(
+					'File is too large even after compression. Maximum allowed size is 100MB.'
+				);
+			}
+		} else {
+			// File is within Supabase object limit → upload as-is
+			objectPath = `${trimmedFileName}/${trimmedVersion}/${originalFileName}`;
+			storagePath = `${STORAGE_BUCKET}/${objectPath}`;
+			contentType = originalContentType;
+			const arrayBuffer = await file.arrayBuffer();
+			fileBuffer = new Uint8Array(arrayBuffer);
+			storedFileSize = file.size;
+			storedFileType = contentType;
+		}
+	} catch (err) {
+		console.error('Error preparing file for upload (compression step):', err);
+		return internalError('Failed to prepare file for upload');
+	}
+
+	try {
 		const { error: uploadError } = await supabase.storage
 			.from(STORAGE_BUCKET)
 			.upload(objectPath, fileBuffer, {
@@ -316,9 +369,14 @@ export const POST: RequestHandler = async ({ request }) => {
 				file_metadata_id: fileMetadata.id,
 				version: trimmedVersion,
 				storage_path: storagePath,
-				file_size: file.size,
-				file_type: contentType,
-				metadata: metadata ?? {},
+				file_size: storedFileSize,
+				file_type: storedFileType,
+				metadata: {
+					...(metadata ?? {}),
+					compression: isCompressed ? 'zip' : 'none',
+					originalFileSize,
+					originalFileType
+				},
 				uploaded_by: uploaderName
 			})
 			.select('id, uploaded_at')
