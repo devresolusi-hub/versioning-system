@@ -21,9 +21,7 @@ A lightweight file versioning system that allows automated CI/CD pipelines to up
 ### 1.3 Technology Stack
 - **Frontend/Backend:** SvelteKit (SSR + API routes)
 - **Database:** Supabase (PostgreSQL)
-- **Storage:**
-  - Supabase Storage (public bucket `files`) for files up to 50MB.
-  - MEGA Cloud Storage (via `megajs`) for larger files (up to the 100MB request limit).
+- **Storage:** External (clients provide pre-uploaded file URLs)
 - **Deployment:** Vercel/Netlify (recommended)
 
 ---
@@ -77,23 +75,16 @@ A lightweight file versioning system that allows automated CI/CD pipelines to up
 
 #### 2.2.2 API Layer
 - **Route: `/api/upload` (Upload Endpoint)**
-  - Accepts multipart/form-data
+  - Accepts form data with file metadata
   - Validates API key authentication
-  - Handles file upload to Supabase Storage
+  - Registers file version with provided URL
   - Creates database records
 
 #### 2.2.3 Data Layer
 - **Supabase PostgreSQL Database**
   - Stores file metadata and version information
   - Manages relationships between files and versions
-
-- **Supabase Storage**
-  - Stores actual file binaries for objects ≤ 50MB
-  - Organized by file name and version
-
-- **MEGA Cloud Storage**
-  - Stores larger file binaries using `megajs`
-  - Exposes public links that are stored directly in the `versions.storage_path` column
+  - Stores file URLs (files hosted externally)
 
 ---
 
@@ -219,7 +210,7 @@ CREATE TABLE versions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     file_metadata_id UUID NOT NULL REFERENCES file_metadata(id) ON DELETE CASCADE,
     version VARCHAR(50) NOT NULL,
-    storage_path TEXT NOT NULL,
+    file_url TEXT NOT NULL,
     file_size BIGINT NOT NULL,
     file_type VARCHAR(100),
     uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -229,8 +220,6 @@ CREATE TABLE versions (
     
     UNIQUE(file_metadata_id, version)
 );
-
--- Indexes for performance
 CREATE INDEX idx_versions_file_metadata ON versions(file_metadata_id);
 CREATE INDEX idx_versions_latest ON versions(is_latest) WHERE is_latest = TRUE;
 CREATE INDEX idx_versions_uploaded ON versions(uploaded_at DESC);
@@ -241,7 +230,7 @@ CREATE INDEX idx_versions_uploaded_by ON versions(uploaded_by);
 - `id`: Unique identifier (UUID)
 - `file_metadata_id`: Foreign key to file_metadata
 - `version`: Version string (e.g., "1.0.0", "2.1.3", "build-123")
-- `storage_path`: Supabase storage key (e.g. `files/myapp/1.0.0/app.zip`) **or** full external URL (e.g. MEGA link)
+- `file_url`: Full Download URL
 - `file_size`: File size in bytes
 - `file_type`: MIME type (e.g., "application/zip")
 - `uploaded_at`: Upload timestamp
@@ -257,37 +246,19 @@ CREATE INDEX idx_versions_uploaded_by ON versions(uploaded_by);
 
 ### 3.3 Storage Structure
 
-**Supabase Storage Bucket:** `files` (public bucket)
+**External Storage:** Files are hosted on external storage providers (e.g., CDN, cloud storage, file servers)
 
-**Path Convention (Supabase-backed files):**
-```
-files/
-  ├── {file_name}/
-  │   ├── {version}/
-  │   │   └── {original_filename}
-  │   └── {version}/
-  │       └── {original_filename}
-  └── {file_name}/
-      └── {version}/
-          └── {original_filename}
-```
+**Database Storage:**
+- The `versions` table stores the complete `file_url` for each version
+- URLs can point to any accessible location (CDN, S3, Azure Blob, etc.)
+- No specific path convention is enforced
 
-**Example (Supabase):**
+**Example URLs:**
 ```
-files/
-  ├── myapp/
-  │   ├── 1.0.0/
-  │   │   └── myapp-v1.0.0.zip
-  │   └── 2.0.1/
-  │       └── myapp-v2.0.1.zip
-  └── tool-installer/
-      └── 1.5.0/
-          └── installer.exe
+https://cdn.example.com/releases/myapp/1.0.0/myapp-v1.0.0.zip
+https://storage.example.com/files/tool-installer-1.5.0.exe
+https://github.com/user/repo/releases/download/v2.0.1/app.zip
 ```
-
-**MEGA-backed files:**
-- For files stored in MEGA, the `storage_path` column stores the full MEGA link (e.g. `https://mega.nz/file/...`).
-- The home page uses the `storage_path` directly as the download URL when it starts with `http://` or `https://`.
 
 ---
 
@@ -449,7 +420,7 @@ SELECT
             'file_size', v.file_size,
             'file_type', v.file_type,
             'uploaded_at', v.uploaded_at,
-            'storage_path', v.storage_path,
+            'file_url', v.file_url,
             'is_latest', v.is_latest
         ) ORDER BY v.uploaded_at DESC
     ) as versions
@@ -485,9 +456,11 @@ Content-Type: multipart/form-data; boundary=----WebKitFormBoundary
 
 #### Request Body (Form Data)
 ```
-file: <binary file data> (required)
 fileName: "myapp" (required)
 version: "1.0.0" (required)
+fileUrl: "https://cdn.example.com/myapp-1.0.0.zip" (required)
+fileSize: "2048576" (required, bytes as string)
+fileType: "application/zip" (required)
 metadata: {"commit": "abc123", "branch": "main"} (optional, JSON string)
 ```
 
@@ -495,48 +468,26 @@ metadata: {"commit": "abc123", "branch": "main"} (optional, JSON string)
 
 | Field      | Type   | Required | Description                              |
 |------------|--------|----------|------------------------------------------|
-| file       | File   | Yes      | The binary file to upload                |
 | fileName   | String | Yes      | Base file name (alphanumeric, dash, underscore) |
 | version    | String | Yes      | Version identifier (semantic versioning recommended) |
+| fileUrl    | String | Yes      | Pre-uploaded file URL (must be accessible) |
+| fileSize   | String | Yes      | File size in bytes                       |
+| fileType   | String | Yes      | MIME type (e.g., "application/zip")     |
 | metadata   | JSON   | No       | Additional metadata (commit, build info) |
 
 #### Success Response (201 Created)
-For Supabase-backed files:
 ```json
 {
   "success": true,
-  "message": "File uploaded successfully",
+  "message": "File version registered successfully",
   "data": {
     "fileMetadataId": "uuid-here",
     "versionId": "uuid-here",
     "fileName": "myapp",
     "version": "1.0.0",
-    "storagePath": "files/myapp/1.0.0/myapp-v1.0.0.zip",
-    "storageProvider": "supabase",
+    "fileUrl": "https://cdn.example.com/myapp-1.0.0.zip",
     "fileSize": 2048576,
     "fileType": "application/zip",
-    "downloadUrl": "https://your-supabase-project.supabase.co/storage/v1/object/public/files/myapp/1.0.0/myapp-v1.0.0.zip",
-    "uploadedAt": "2025-12-16T10:30:00Z",
-    "uploadedBy": "github-actions-main"
-  }
-}
-```
-
-For MEGA-backed files:
-```json
-{
-  "success": true,
-  "message": "File uploaded successfully",
-  "data": {
-    "fileMetadataId": "uuid-here",
-    "versionId": "uuid-here",
-    "fileName": "big-video",
-    "version": "1.0.0",
-    "storagePath": "https://mega.nz/file/....",
-    "storageProvider": "mega",
-    "fileSize": 67917768,
-    "fileType": "video/quicktime",
-    "downloadUrl": "https://mega.nz/file/....",
     "uploadedAt": "2025-12-16T10:30:00Z",
     "uploadedBy": "github-actions-main"
   }
@@ -572,14 +523,7 @@ For MEGA-backed files:
 }
 ```
 
-**413 Payload Too Large** - File size exceeds limit
-```json
-{
-  "success": false,
-  "error": "Payload Too Large",
-  "message": "File size exceeds maximum allowed size of 100MB"
-}
-```
+
 
 **500 Internal Server Error** - Server error
 ```json
@@ -776,7 +720,7 @@ console.log('New API Key:', generateApiKey());
    │   ├─► Check required fields (file, fileName, version)
    │   ├─► Validate fileName format (alphanumeric, dash, underscore)
    │   ├─► Validate version format
-   │   ├─► Check file size (max 100MB recommended)
+   │   ├─► Check file size (max 50MB)
    │   └─► If invalid: Return 400
    │
    ├─► Check for Duplicate Version
@@ -787,25 +731,13 @@ console.log('New API Key:', generateApiKey());
    │   ├─► Query: SELECT FROM file_metadata WHERE file_name = ?
    │   └─► If not exists: INSERT INTO file_metadata
    │
-   ├─► Decide Storage Provider
-   │   ├─► If file size ≤ 50MB:
-   │   │     ├─► Generate storage path: files/{fileName}/{version}/{originalFileName}
-   │   │     └─► Upload file to Supabase Storage (bucket `files`)
-   │   └─► If file size > 50MB:
-   │         ├─► Upload file to MEGA via `megajs`
-   │         └─► Store MEGA public link as storage_path
-   │
    ├─► Create Version Record
-   │   ├─► INSERT INTO versions (include uploaded_by = key_name, plus storage metadata)
+   │   ├─► INSERT INTO versions (include uploaded_by = key_name, file_url from client)
    │   ├─► Trigger automatically updates is_latest flag
-   │   └─► If fails: Rollback storage upload & Return 500
-   │
-   ├─► Generate Download URL
-   │   ├─► If using Supabase: get public URL from Supabase Storage (with fallback)
-   │   └─► If using MEGA: use MEGA public link directly
+   │   └─► If fails: Return 500
    │
    └─► Return Success Response (201)
-       └─► Include downloadUrl, versionId, metadata, uploaded_by
+       └─► Include fileUrl, versionId, metadata, uploaded_by
 ```
 
 ---
@@ -826,9 +758,9 @@ console.log('New API Key:', generateApiKey());
 - Versions are immutable - once uploaded, they cannot be modified
 
 #### 5.1.3 Storage Organization
-- Files are organized hierarchically: `{file_name}/{version}/{actual_file}`
-- This structure allows easy browsing and prevents naming conflicts
-- Public bucket allows direct download links without authentication
+- Files are hosted externally (CDN, cloud storage, etc.)
+- Clients are responsible for uploading files and providing accessible URLs
+- The system only stores and manages file metadata and URLs
 
 #### 5.1.4 Public vs Protected Access
 - **Public Access:** Anyone can view and download files (read-only)
@@ -982,7 +914,6 @@ console.log('New API Key:', generateApiKey());
 **System Health:**
 - API response times
 - Database query performance
-- Storage bucket capacity
 - Error rates (4xx, 5xx responses)
 
 #### 5.5.2 Logging Strategy
@@ -1090,25 +1021,39 @@ jobs:
           npm run build
           zip -r myapp-${{ github.event.release.tag_name }}.zip dist/
       
-      - name: Upload to File Versioning System
+      - name: Upload to CDN/Storage
+        id: upload
+        run: |
+          # Upload to your CDN or storage provider
+          # This example assumes you get back a URL
+          FILE_URL=$(upload-to-cdn myapp-${{ github.event.release.tag_name }}.zip)
+          echo "file_url=$FILE_URL" >> $GITHUB_OUTPUT
+          echo "file_size=$(stat -f%z myapp-${{ github.event.release.tag_name }}.zip)" >> $GITHUB_OUTPUT
+      
+      - name: Register with Versioning System
         run: |
           curl -X POST https://your-domain.com/api/upload \
             -H "Authorization: Bearer ${{ secrets.UPLOAD_API_KEY }}" \
-            -F "file=@myapp-${{ github.event.release.tag_name }}.zip" \
             -F "fileName=myapp" \
             -F "version=${{ github.event.release.tag_name }}" \
+            -F "fileUrl=${{ steps.upload.outputs.file_url }}" \
+            -F "fileSize=${{ steps.upload.outputs.file_size }}" \
+            -F "fileType=application/zip" \
             -F 'metadata={"commit":"${{ github.sha }}","branch":"main"}'
 ```
 
 #### 5.7.2 Manual Upload - cURL
 
 ```bash
-# Upload a file
+# First, upload your file to your CDN/storage provider
+# Then register it with the versioning system
 curl -X POST https://your-domain.com/api/upload \
   -H "Authorization: Bearer your-api-key-here" \
-  -F "file=@./build/myapp-v1.0.0.zip" \
   -F "fileName=myapp" \
   -F "version=1.0.0" \
+  -F "fileUrl=https://cdn.example.com/myapp-v1.0.0.zip" \
+  -F "fileSize=2048576" \
+  -F "fileType=application/zip" \
   -F 'metadata={"buildNumber":"123","commitHash":"abc123"}'
 ```
 

@@ -8,7 +8,7 @@ type VersionRow = {
 	file_size: number;
 	file_type: string | null;
 	uploaded_at: string;
-	storage_path: string;
+	file_url: string;
 	is_latest: boolean;
 };
 
@@ -26,7 +26,7 @@ export type FileVersionView = {
 	fileSize: number;
 	fileType: string | null;
 	uploadedAt: string;
-	storagePath: string;
+	fileUrl: string;
 	isLatest: boolean;
 	downloadUrl: string | null;
 };
@@ -42,84 +42,36 @@ export type FileView = {
 export const load: PageServerLoad = async () => {
 	try {
 		if (!PUBLIC_SUPABASE_URL || !PUBLIC_SUPABASE_ANON_KEY) {
-			console.error('Missing PUBLIC_SUPABASE_URL or PUBLIC_SUPABASE_ANON_KEY');
-			return {
-				files: [] as FileView[],
-				loadError: 'Server configuration error: Supabase environment variables are missing.'
-			};
+			return { releases: [], loadError: 'Supabase env vars missing.' };
 		}
-
-		const supabase = createClient(PUBLIC_SUPABASE_URL, PUBLIC_SUPABASE_ANON_KEY, {
-			auth: {
-				autoRefreshToken: false,
-				persistSession: false
-			}
-		});
-
+		const supabase = createClient(PUBLIC_SUPABASE_URL, PUBLIC_SUPABASE_ANON_KEY);
 		const { data, error } = await supabase
-			.from('file_metadata')
-			.select(
-				'id, file_name, created_at, updated_at, versions(id, version, file_size, file_type, uploaded_at, storage_path, is_latest)'
-			)
-			.order('updated_at', { ascending: false });
+			.from('versions')
+			.select('*, file_metadata(*)')
+			.order('uploaded_at', { ascending: false });
 
 		if (error) {
-			console.error('Error fetching file metadata:', error);
-			return {
-				files: [] as FileView[],
-				loadError: 'Failed to load files. Please try again later.'
-			};
+			console.error('Error loading releases from Supabase:', error);
+			return { releases: [], loadError: 'Failed to load releases' };
 		}
 
-		const baseUrl = PUBLIC_SUPABASE_URL.replace(/\/$/, '');
-		const downloadBase = `${baseUrl}/storage/v1/object/public`;
+		// Map database columns to frontend expectations
+		const releases = data.map((version: any) => ({
+			id: version.id,
+			asset_name: version.file_metadata?.file_name ?? 'Unknown File',
+			repo: 'project-versioning', // Default or derived
+			tag: version.version,
+			uploader: version.uploaded_by,
+			published_at: version.uploaded_at,
+			asset_size: version.file_size,
+			fileUrl: version.file_url,
+			is_latest: version.is_latest
+		}));
 
-		const files: FileView[] = (data ?? []).map((row) => {
-			const fileRow = row as FileRow;
-
-			const versions = (fileRow.versions ?? [])
-				.slice()
-				.sort((a, b) => new Date(b.uploaded_at).getTime() - new Date(a.uploaded_at).getTime())
-				.map<FileVersionView>((v) => {
-					const storagePath = v.storage_path;
-					// If storagePath is already a full URL (e.g. MEGA link), use it directly.
-					// Otherwise, construct a Supabase public URL.
-					const downloadUrl =
-						storagePath.startsWith('http://') || storagePath.startsWith('https://')
-							? storagePath
-							: `${downloadBase}/${storagePath}`;
-
-					return {
-						id: v.id,
-						version: v.version,
-						fileSize: v.file_size,
-						fileType: v.file_type,
-						uploadedAt: v.uploaded_at,
-						storagePath,
-						isLatest: v.is_latest,
-						downloadUrl
-					};
-				});
-
-			return {
-				id: fileRow.id,
-				fileName: fileRow.file_name,
-				createdAt: fileRow.created_at,
-				updatedAt: fileRow.updated_at,
-				versions
-			};
-		});
-
-		return {
-			files,
-			loadError: null as string | null
-		};
+		return { releases };
 	} catch (err) {
-		console.error('Unexpected error in home page load:', err);
-		return {
-			files: [] as FileView[],
-			loadError: 'Unexpected error while loading files.'
-		};
+		console.error('Unexpected error loading releases:', err);
+		return { releases: [], loadError: 'Error loading releases' };
 	}
 };
 

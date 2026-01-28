@@ -1,11 +1,9 @@
 <script lang="ts">
 	import type { PageData } from './$types';
-	import type { FileView, FileVersionView } from './+page.server';
 
 	let { data } = $props<{ data: PageData }>();
-
-	const files = (data.files ?? []) as FileView[];
-	const loadError = data.loadError as string | null;
+	const releases = data.releases ?? [];
+	const loadError = data.loadError ?? null;
 
 	function formatBytes(bytes: number): string {
 		if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
@@ -24,14 +22,6 @@
 		if (Number.isNaN(date.getTime())) return iso;
 		return date.toLocaleString();
 	}
-
-	function hasVersions(file: FileView): boolean {
-		return Array.isArray(file.versions) && file.versions.length > 0;
-	}
-
-	function latestVersion(file: FileView): FileVersionView | null {
-		return hasVersions(file) ? file.versions[0] : null;
-	}
 </script>
 
 <svelte:head>
@@ -48,70 +38,47 @@
 
 	{#if loadError}
 		<section class="state state-error">
-			<h2>Unable to load files</h2>
+			<h2>Unable to load releases</h2>
 			<p>{loadError}</p>
 		</section>
-	{:else if files.length === 0}
+	{:else if releases.length === 0}
 		<section class="state state-empty">
-			<h2>No files yet</h2>
-			<p>Once your CI/CD pipeline uploads a build, it will appear here with all its versions.</p>
+			<h2>No releases yet</h2>
+			<p>Once your CI/CD pipeline uploads a build, it will appear here.</p>
 		</section>
 	{:else}
 		<section class="file-list">
-			{#each files as file}
+			{#each releases as release}
 				<article class="file-card">
 					<header class="file-header">
 						<div>
-							<h2>{file.fileName}</h2>
+							<h2>{release.asset_name}</h2>
 							<p class="file-meta">
-								<span>Created: {formatDate(file.createdAt)}</span>
-								<span>Last updated: {formatDate(file.updatedAt)}</span>
+								<span>Repo: <b>{release.repo}</b></span>
+								<span>Tag: <b>{release.tag}</b></span>
+								<span>By: {release.uploader ?? 'CI'}</span>
 							</p>
 						</div>
-						{#if latestVersion(file)}
-							<div class="latest-chip">
-								<span class="chip-label">Latest</span>
-								<span class="chip-version">v{latestVersion(file)!.version}</span>
-							</div>
-						{/if}
+						<div class="latest-chip">
+							<span class="chip-version">{formatDate(release.published_at)}</span>
+						</div>
 					</header>
-
-					{#if !hasVersions(file)}
-						<p class="no-versions">No versions uploaded yet.</p>
-					{:else}
-						<ul class="versions">
-							{#each file.versions as version}
-								<li class:latest={version.isLatest} class="version-row">
-									<div class="version-main">
-										<div class="version-title">
-											<span class="version-badge">v{version.version}</span>
-											{#if version.isLatest}
-												<span class="badge-latest">Latest</span>
-											{/if}
-										</div>
-										<div class="version-meta">
-											<span>{formatBytes(version.fileSize)}</span>
-											{#if version.fileType}
-												<span>{version.fileType}</span>
-											{/if}
-											<span>Uploaded: {formatDate(version.uploadedAt)}</span>
-										</div>
-									</div>
-									{#if version.downloadUrl}
-										<div class="version-actions">
-											<a
-												class="button button-primary"
-												href={version.downloadUrl}
-												rel="noreferrer"
-											>
-												Download
-											</a>
-										</div>
-									{/if}
-								</li>
-							{/each}
-						</ul>
-					{/if}
+					<ul class="versions">
+						<li class="version-row">
+							<div class="version-main">
+								<div class="version-title">
+									<span class="version-badge">{release.tag}</span>
+								</div>
+								<div class="version-meta">
+									<span>{formatBytes(release.asset_size)}</span>
+									<span>Published: {formatDate(release.published_at)}</span>
+								</div>
+							</div>
+							<div class="version-actions">
+								<a class="button button-primary" href={release.fileUrl} download> Download </a>
+							</div>
+						</li>
+					</ul>
 				</article>
 			{/each}
 		</section>
@@ -123,7 +90,12 @@
 		max-width: 960px;
 		margin: 0 auto;
 		padding: 2.5rem 1.5rem 3rem;
-		font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+		font-family:
+			system-ui,
+			-apple-system,
+			BlinkMacSystemFont,
+			'Segoe UI',
+			sans-serif;
 		color: #0f172a;
 	}
 
@@ -240,7 +212,10 @@
 		gap: 0.75rem;
 		padding: 0.55rem 0.6rem;
 		border-radius: 0.65rem;
-		transition: background 0.15s ease, box-shadow 0.15s ease, transform 0.1s ease;
+		transition:
+			background 0.15s ease,
+			box-shadow 0.15s ease,
+			transform 0.1s ease;
 	}
 
 	.version-row:hover {
@@ -312,8 +287,12 @@
 		font-weight: 500;
 		text-decoration: none;
 		cursor: pointer;
-		transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease,
-			box-shadow 0.15s ease, transform 0.1s ease;
+		transition:
+			background 0.15s ease,
+			color 0.15s ease,
+			border-color 0.15s ease,
+			box-shadow 0.15s ease,
+			transform 0.1s ease;
 	}
 
 	.button-primary {

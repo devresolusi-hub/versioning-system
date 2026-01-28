@@ -1,12 +1,10 @@
-# File Versioning System (SvelteKit + Supabase + MEGA)
+# File Versioning System (SvelteKit + Supabase)
 
 A lightweight file versioning system for CI/CD pipelines:
 
 - **Upload** versioned build artifacts from CI/CD via a protected `POST /api/upload` endpoint (API key auth).
 - **Browse & download** files and all their versions from a public web UI at `/`.
-- **Store & track** metadata in Supabase PostgreSQL, with:
-  - **Supabase Storage** as the backing store for files up to 50MB.
-  - **MEGA (via `megajs`)** as the backing store for larger files (up to 100MB).
+- **Store & track** metadata in Supabase PostgreSQL with file URLs pointing to external storage.
 
 The full design is described in `docs/SDD.md`.
 
@@ -16,9 +14,7 @@ The full design is described in `docs/SDD.md`.
 
 - **App**: SvelteKit (SSR + API routes)
 - **Database**: Supabase PostgreSQL
-- **Storage**:
-  - Supabase Storage (public bucket `files`) for objects ≤ 50MB.
-  - MEGA Cloud Storage (via `megajs`) for larger objects.
+- **Storage**: External (clients provide pre-uploaded file URLs)
 - **Auth**: Database-backed API keys (`api_keys` table)
 - **Deployment**: Any SvelteKit host (Vercel recommended)
 
@@ -46,14 +42,12 @@ pnpm install
    cp .env.example .env
    ```
 
-2. Fill in the values from your Supabase project and MEGA account:
+2. Fill in the values from your Supabase project:
 
 - `PUBLIC_SUPABASE_URL`
 - `PUBLIC_SUPABASE_ANON_KEY`
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `DATABASE_URL` (Supabase Postgres connection string)
-- `MEGA_EMAIL` (email for the MEGA account used for large-file storage)
-- `MEGA_PASSWORD` (password for the MEGA account)
 
 See `docs/DEVELOPER.md` for details.
 
@@ -90,24 +84,20 @@ Visit `http://localhost:5173` to see the file listing UI.
   - Lists all files (`file_metadata`) with their versions.
   - Shows size, MIME type, upload time.
   - Highlights the latest version with a badge.
-  - Provides download links that point either to:
-    - Supabase public URLs (for files stored in Supabase), or
-    - Direct external URLs (e.g. MEGA links) when `storage_path` is a full URL.
+  - Provides download links using stored `file_url`.
 
 - **Upload Endpoint (`POST /api/upload`)**
   - Authenticated with an API key in `Authorization: Bearer <KEY>`.
-  - Accepts `multipart/form-data`:
-    - `file` (binary, required)
+  - Accepts form data:
     - `fileName` (string, required; `[A-Za-z0-9_-]+`)
     - `version` (string, required; `[A-Za-z0-9._-]+`)
+    - `fileUrl` (string, required; pre-uploaded file URL)
+    - `fileSize` (string, required; file size in bytes)
+    - `fileType` (string, required; MIME type)
     - `metadata` (JSON string, optional)
-  - Enforces 100MB max file size.
-  - For files **≤ 50MB**:
-    - Stored in Supabase Storage under `files/{fileName}/{version}/{originalFilename}`.
-  - For files **> 50MB**:
-    - Stored in MEGA using `megajs`, and the public MEGA link is saved as `storage_path`.
+  - Registers file version with provided URL.
   - Rejects duplicate `(fileName, version)` combinations with `409 Conflict`.
-  - Persists all metadata in the `versions` table, including the storage provider.
+  - Persists all metadata in the `versions` table.
 
 ---
 
@@ -142,6 +132,6 @@ Common `package.json` scripts:
 ## Status
 
 - ✅ Core schema, migrations, and seeders implemented.
-- ✅ `/api/upload` endpoint implemented (Supabase Storage + MEGA for large files + Postgres).
+- ✅ `/api/upload` endpoint implemented (metadata registration only).
 - ✅ Home page implemented (lists files and versions with download links).
 - 🚧 API key management scripts and full CI templates are being iterated in `docs/INTEGRATION.md`.
